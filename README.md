@@ -2,7 +2,7 @@
 
 Code and data for the comparison reported in our research paper / bachelor project
 *AI-Driven Platform for Personalized Global Opportunity Matching* (Kardan University).
-Everything is re-computable: open the notebook, press **Run all**, and the tables and graph are produced from the data in this repository.
+Everything is re-computable: open the notebook, press **Run all**, and the tables and graph are produced from the data files in this repository.
 
 ## What is compared
 | Method | Description |
@@ -12,7 +12,7 @@ Everything is re-computable: open the notebook, press **Run all**, and the table
 | Hybrid | 0.5 × TF-IDF + 0.5 × Embedding, each score min–max scaled per query (weight fixed before any run) |
 
 ## Two independent evaluations
-**A. Full-dataset benchmark (all 3,043 ESCO occupations, ground truth from ESCO itself)** — `notebooks/ESCO_benchmark.ipynb`, `src/esco_benchmark.py`
+**A. Full-dataset benchmark (all 3,043 ESCO occupations, ground truth from ESCO itself)** — `ESCO_benchmark.ipynb`, `esco_benchmark.py`
 * Query = the essential skills of one occupation (`full`) or a random half of them (`half`, seed 42). 3,042 occupations have ≥ 4 essential skills and are used as queries.
 * Documents = title + alternative names + description. The skills are **not** in the document text.
 * Relevant = the same occupation (grade 2) or another occupation in the same ISCO-08 4-digit group (grade 1).
@@ -20,20 +20,20 @@ Everything is re-computable: open the notebook, press **Run all**, and the table
 * The `ceiling` row gives the best score any method could reach (many ISCO groups hold fewer than 5 occupations, so Precision@5 cannot reach 1).
 * The hybrid-weight sweep is a sensitivity analysis only; it is not used to pick the weight.
 
-**B. Human judgments (50 profiles, 432 judged pairs)** — `human_eval/`, `src/evaluate_human_judgments.py`
+**B. Human judgments (50 profiles, 432 judged pairs)** — `judgments_*.csv`, `rankings.csv`, `evaluate_human_judgments.py`
 Top-5 results of the three methods were pooled, shuffled and scored 0/1/2 blind by three team members (80 pairs scored twice).
-`python src/evaluate_human_judgments.py` reproduces the numbers in the paper (Precision@5 0.928 / 0.936 / 0.944 for TF-IDF / Embedding / Hybrid; no difference significant).
+`python evaluate_human_judgments.py` reproduces the numbers in the paper (Precision@5 0.928 / 0.936 / 0.944 for TF-IDF / Embedding / Hybrid; no difference significant).
 
 ## Run
-Colab: open `notebooks/ESCO_benchmark.ipynb` (edit `bahrambehroZ` in the first cell and in the badge), then *Runtime → Run all* (about 5–10 min, CPU is enough).
+Colab: open `ESCO_benchmark.ipynb` in Colab, then *Runtime → Run all* (about 5–10 min, CPU is enough).
 
 Local:
 ```
 pip install -r requirements.txt
-python src/esco_benchmark.py            # results/ gets summary_sbert.csv, significance_sbert.csv, comparison_sbert.png
-python src/evaluate_human_judgments.py
+python esco_benchmark.py            # results/ gets summary_sbert.csv, significance_sbert.csv, comparison_sbert.png
+python evaluate_human_judgments.py
 ```
-`data/` was built from the official ESCO v1.2.1 CSV download with `src/prepare_esco_data.py` (run it yourself to verify).
+The two `esco_*.csv` files were built from the official ESCO v1.2.1 CSV download with `prepare_esco_data.py` (run it yourself to verify).
 
 ## Limitations (please read)
 * Ground truth in A is ESCO's own classification, not human relevance. "Same ISCO group" is a reasonable but imperfect notion of relevance, and queries are skill lists of ESCO occupations, not real CVs.
