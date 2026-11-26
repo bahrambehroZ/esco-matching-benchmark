@@ -1,0 +1,175 @@
+# %% [markdown]
+# # TF-IDF vs. sentence embeddings vs. hybrid on the full ESCO occupation dataset
+# Task: given the skills of a person, rank the 3,043 ESCO occupations (the dataset used by the GOP platform).
+# Ground truth comes from ESCO itself (no human labels needed), so every number can be re-computed by anyone.
+#
+# * Query  = the essential skills of one occupation (variant `full`) or a random half of them (variant `half`).
+# * Documents = title + alternative names + description of every occupation (the skills are NOT in the document text).
+# * Relevant = the same occupation (grade 2) or another occupation of the same ISCO-08 4-digit group (grade 1).
+# * Metrics @5: Precision, Recall, F1, NDCG, plus Hit@1 / Hit@5 / MRR of the exact occupation.
+# * Hybrid = 0.5 * TF-IDF + 0.5 * embedding (each min-max scaled per query). The weight is fixed in advance;
+#   the alpha sweep at the end is a sensitivity analysis only and is not used to choose the weight.
+
+# %%
+import os, sys, math, json, random, argparse, warnings
+import numpy as np, pandas as pd
+from scipy.stats import wilcoxon
+from sklearn.feature_extraction.text import TfidfVectorizer
+warnings.filterwarnings("ignore")
+
+SEED = 42
+K = 5
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+ALPHA = 0.5          # hybrid weight, fixed before running
+random.seed(SEED); np.random.seed(SEED)
+
+# %%
+def load_data(data_dir="data"):
+    occ = pd.read_csv(os.path.join(data_dir, "esco_occupations_text.csv"), dtype=str).fillna("")
+    sk = pd.read_csv(os.path.join(data_dir, "esco_essential_skills.csv"), dtype=str).fillna("")
+    skills = sk.groupby("occ_uri")["skill"].apply(list).to_dict()
+    occ["doc"] = (occ.title + ". " + occ.alt_labels + ". " + occ.description).str.strip()
+    return occ, skills
+
+def make_queries(occ, skills, variant, min_skills=4):
+    rng = random.Random(SEED)
+    rows = []
+    for i, r in occ.iterrows():
+        s = skills.get(r.occ_uri, [])
+        if len(s) < min_skills:
+            continue
+        if variant == "half":
+            s = sorted(rng.sample(s, max(2, len(s) // 2)))
+        rows.append((i, "; ".join(s)))
+    return pd.DataFrame(rows, columns=["occ_idx", "query"])
+
+# %%
+def minmax(M):
+    lo = M.min(1, keepdims=True); hi = M.max(1, keepdims=True)
+    return (M - lo) / np.where(hi - lo == 0, 1, hi - lo)
+
+def tfidf_scores(docs, queries):
+    v = TfidfVectorizer(lowercase=True, stop_words="english", ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+    D = v.fit_transform(docs); Q = v.transform(queries)
+    return (Q @ D.T).toarray()
+
+def embed_scores(docs, queries, backend="sbert"):
+    if backend == "sbert":
+        from sentence_transformers import SentenceTransformer
+        m = SentenceTransformer(MODEL)
+        D = m.encode(list(docs), batch_size=64, normalize_embeddings=True, show_progress_bar=True)
+        Q = m.encode(list(queries), batch_size=64, normalize_embeddings=True, show_progress_bar=True)
+        return Q @ D.T
+    if backend == "stub":   # ONLY for testing the pipeline without internet. NOT an embedding model.
+        from sklearn.decomposition import TruncatedSVD
+        v = TfidfVectorizer(stop_words="english", sublinear_tf=True)
+        X = v.fit_transform(list(docs))
+        svd = TruncatedSVD(200, random_state=SEED).fit(X)
+        D = svd.transform(X); Q = svd.transform(v.transform(queries))
+        D /= np.linalg.norm(D, axis=1, keepdims=True) + 1e-9; Q /= np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9
+        return Q @ D.T
+    raise ValueError(backend)
+
+# %%
+def evaluate(S, occ, occ_idx):
+    """S: (n_queries x n_docs) score matrix. Returns per-query metrics DataFrame."""
+    isco = occ.isco4.values
+    group_size = occ.groupby("isco4").size().to_dict()
+    out = []
+    for qi, oi in enumerate(occ_idx):
+        order = np.lexsort((np.arange(S.shape[1]), -S[qi]))     # score desc, ties by index
+        top = order[:K]
+        rel = np.where(isco[top] == isco[oi], 1, 0)
+        rel = np.where(top == oi, 2, rel)
+        n_rel = group_size[isco[oi]]
+        hits = int((rel >= 1).sum())
+        p = hits / K; r = hits / n_rel
+        f1 = 0 if p + r == 0 else 2 * p * r / (p + r)
+        dcg = sum((2 ** g - 1) / math.log2(i + 2) for i, g in enumerate(rel))
+        ideal = [2] + [1] * (n_rel - 1)
+        idcg = sum((2 ** g - 1) / math.log2(i + 2) for i, g in enumerate(ideal[:K]))
+        exact_rank = int((S[qi] > S[qi, oi]).sum()) + 1
+        out.append(dict(P=p, R=r, F1=f1, NDCG=dcg / idcg, Hit1=float(exact_rank == 1),
+                        Hit5=float(exact_rank <= 5), MRR=1.0 / exact_rank))
+    return pd.DataFrame(out)
+
+def bootstrap_ci(x, n=2000):
+    rng = np.random.default_rng(SEED); x = np.asarray(x)
+    m = [x[rng.integers(0, len(x), len(x))].mean() for _ in range(n)]
+    return np.percentile(m, 2.5), np.percentile(m, 97.5)
+
+def holm(pvals):
+    idx = np.argsort(pvals); m = len(pvals); adj = np.empty(m); run = 0
+    for rank, i in enumerate(idx):
+        run = max(run, (m - rank) * pvals[i]); adj[i] = min(1, run)
+    return adj
+
+# %%
+def run(data_dir="data", out_dir="results", backend="sbert"):
+    os.makedirs(out_dir, exist_ok=True)
+    occ, skills = load_data(data_dir)
+    summary, per_query, tests = [], {}, []
+    for variant in ("full", "half"):
+        q = make_queries(occ, skills, variant)
+        print(f"[{variant}] {len(q)} queries over {len(occ)} occupations")
+        St = tfidf_scores(occ.doc, q["query"])
+        Se = embed_scores(occ.doc, q["query"], backend)
+        Sh = ALPHA * minmax(St) + (1 - ALPHA) * minmax(Se)
+        mats = {"TF-IDF": St, "Embedding": Se, "Hybrid": Sh}
+        res = {k: evaluate(M, occ, q.occ_idx.values) for k, M in mats.items()}
+        per_query[variant] = res
+        gs = occ.groupby("isco4").size().to_dict(); ng = np.array([gs[occ.isco4[i]] for i in q.occ_idx])
+        summary.append(dict(variant=variant, method="ceiling (best possible)", n_queries=len(q),
+                            P=round(np.minimum(K, ng).mean() / K, 4), R=round((np.minimum(K, ng) / ng).mean(), 4)))
+        for k, df in res.items():
+            row = dict(variant=variant, method=k, n_queries=len(df))
+            for c in ["P", "R", "F1", "NDCG", "Hit1", "Hit5", "MRR"]:
+                lo, hi = bootstrap_ci(df[c].values)
+                row[c] = round(df[c].mean(), 4); row[c + "_lo"] = round(lo, 4); row[c + "_hi"] = round(hi, 4)
+            summary.append(row)
+        for k in ("Embedding", "Hybrid"):
+            for c in ["P", "R", "F1", "NDCG", "MRR"]:
+                d = res[k][c].values - res["TF-IDF"][c].values
+                p = 1.0 if np.allclose(d, 0) else wilcoxon(d).pvalue
+                tests.append(dict(variant=variant, method=k, metric=c, mean_diff_vs_tfidf=round(d.mean(), 4), p=p))
+        # sensitivity analysis (NOT used to pick alpha)
+        for a in (0.0, 0.25, 0.5, 0.75, 1.0):
+            df = evaluate(a * minmax(St) + (1 - a) * minmax(Se), occ, q.occ_idx.values)
+            summary.append(dict(variant=variant, method=f"sweep_tfidf_weight_{a}", n_queries=len(df),
+                                P=round(df.P.mean(), 4), R=round(df.R.mean(), 4), F1=round(df.F1.mean(), 4),
+                                NDCG=round(df.NDCG.mean(), 4), Hit1=round(df.Hit1.mean(), 4),
+                                Hit5=round(df.Hit5.mean(), 4), MRR=round(df.MRR.mean(), 4)))
+    S = pd.DataFrame(summary); T = pd.DataFrame(tests)
+    T["p_holm"] = holm(T.p.values)
+    S.to_csv(os.path.join(out_dir, f"summary_{backend}.csv"), index=False)
+    T.to_csv(os.path.join(out_dir, f"significance_{backend}.csv"), index=False)
+    return S, T, per_query
+
+# %%
+def plot(S, out_dir="results", backend="sbert"):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    main = S[S.method.isin(["TF-IDF", "Embedding", "Hybrid"])]
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+    for a, v in zip(ax, ("full", "half")):
+        d = main[main.variant == v].set_index("method").loc[["TF-IDF", "Embedding", "Hybrid"]]
+        x = np.arange(4); w = 0.26
+        for i, m in enumerate(d.index):
+            vals = [d.loc[m, c] for c in ["P", "R", "F1", "NDCG"]]
+            err = [[d.loc[m, c] - d.loc[m, c + "_lo"] for c in ["P", "R", "F1", "NDCG"]],
+                   [d.loc[m, c + "_hi"] - d.loc[m, c] for c in ["P", "R", "F1", "NDCG"]]]
+            a.bar(x + (i - 1) * w, vals, w, yerr=err, capsize=2, label=m)
+        a.set_xticks(x); a.set_xticklabels(["Precision@5", "Recall@5", "F1@5", "NDCG@5"])
+        a.set_title(f"Query = {'all' if v == 'full' else 'half of the'} essential skills")
+    ax[0].legend(); ax[0].set_ylabel("score (mean, 95% CI)")
+    plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"comparison_{backend}.png"), dpi=200)
+
+# %%
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="data"); ap.add_argument("--out", default="results")
+    ap.add_argument("--backend", default="sbert", choices=["sbert", "stub"])
+    a = ap.parse_args()
+    S, T, _ = run(a.data, a.out, a.backend); plot(S, a.out, a.backend)
+    pd.set_option("display.width", 200)
+    print(S[S.method.isin(["TF-IDF", "Embedding", "Hybrid"])][["variant", "method", "P", "R", "F1", "NDCG", "Hit1", "MRR"]].to_string(index=False))
+    print(T.to_string(index=False))
